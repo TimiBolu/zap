@@ -10,7 +10,7 @@ Thread pools are used everywhere from your favorite I/O event loop (Golang, Toki
 
 ## Why Build Your Own?
 
-A good question. Given the abundance of solutions (I've listed some above), why not just use an existing thread pool? Aren't thread pools a solved problem? Aren't they just all the same: a group of threads? It's reasonable to have this line of though if the processing isn't your main concern. However I like tinkering, optimizing and have quite a bit of free time. These are shared formulas with which helped build the existing solutions.
+A good question. Given the abundance of solutions (I've listed some above), why not just use an existing thread pool? Aren't thread pools a solved problem? Aren't they just all the same: a group of threads? It's reasonable to have this line of thought if the processing isn't your main concern. However I like tinkering, optimizing and have quite a bit of free time. These are shared formulas with which helped build the existing solutions.
 
 First, I'd like to set the stage. I'm very into Zig. The time is somewhere after Zig `0.5`. Andrew just recently introduced Zig's [new `async/await` semantics](https://ziglang.org/download/0.5.0/release-notes.html#Async-Functions) (I hope to do a post about this in the future) and the standard library event loop (async I/O driver) is only at its baby stages. This is a chance to get Zig into the big player domain like Go and Rust for async I/O stuff. A good thread pool appears necessary.
 
@@ -93,7 +93,7 @@ pub fn schedule(task: *Task) void {
     defer held.release();
     
     task.next = stack;
-    stack = task.next;
+    stack = task;
 }
 
 fn runOnEachThread() void {
@@ -147,7 +147,7 @@ If the total work on the system is being pushed in by different threads, then th
 
 **WARNING**: here be atomics. Skip to [Notification Throttling](#Notification-Throttling) to get back into algorithm territory
 
-The first thing we can do is to get rid of the locks on the run queues. When there's a lot of contention a lock, the thread has to be put to sleep. This is a relatively expensive operation compared to the actual dequeue; It's a syscall for the losing thread to sleep and often a syscall for the winning thread to wake up a losing thread. We can avoid this with a few realizations.
+The first thing we can do is to get rid of the locks on the run queues. When there's a lot of contention on a lock, the thread has to be put to sleep. This is a relatively expensive operation compared to the actual dequeue; It's a syscall for the losing thread to sleep and often a syscall for the winning thread to wake up a losing thread. We can avoid this with a few realizations.
 
 One realization is that there's only one producer to our thread local queues while there's multiple consumers in the form of "the work stealing threads". This means we don't need to synchronize the producer side and can use lock-free SPMC (single-producer-multi-consumer) algorithms. Golang uses a good one (which I believed is borrowed from Cilk?) that has a really efficient push() and can steal in batches, all without locks:
 
@@ -239,7 +239,7 @@ This might have been a lot to process, but hopefully the code shows what's going
 
 You also may have noticed that the "try_lock_" in `try_lock_and_pop` for our thread queues is just there to enforce serialization on the consumer side. There's also still only one producer. Using these assumptions, we can reduce the queues down to non-blocking-lock protected lock-free SPSC queues. This would allow the producer to operate lock-free to the consumer and remove the final blocking serialization point that is `lock_and_push()`.
 
-Unfortunately, there don't seem to be any unbounded lock-free SPSC queues out there which are fully intrusive *and* don't use atomic read-modify-write instructions (that's generally avoided for SPSC). But that's fine! We can just use an intrusive unbounded MPSC instead. Dmitry Vyukov developed/discovered a [fast algorithm](https://www.1024cores.net/home/lock-free-algorithms/queues/intrusive-mpsc-node-based-queue) for such use-case a while back which has been well known and used everywhere from [Rust stdlib](https://doc.rust-lang.org/src/std/sync/mpsc/mpsc_queue.rs.html) to [Apple GCD](https://github.com/apple/swift-corelibs-libdispatch/blob/34f383d34450d47dd5bdfdf675fcdaa0d0ec8031/src/inline_internal.h#L1510) to [Ponylang](https://github.com/ponylang/ponyc/blob/7d38ffa91cf5f89f94daf6f195dfae3bd3395355/src/libponyrt/actor/messageq.c#L31).
+Unfortunately, there doesn't seem to be any unbounded lock-free SPSC queues out there which are fully intrusive *and* don't use atomic read-modify-write instructions (that's generally avoided for SPSC). But that's fine! We can just use an intrusive unbounded MPSC instead. Dmitry Vyukov developed/discovered a [fast algorithm](https://www.1024cores.net/home/lock-free-algorithms/queues/intrusive-mpsc-node-based-queue) for such use-case a while back which has been well known and used everywhere from [Rust stdlib](https://doc.rust-lang.org/src/std/sync/mpsc/mpsc_queue.rs.html) to [Apple GCD](https://github.com/apple/swift-corelibs-libdispatch/blob/34f383d34450d47dd5bdfdf675fcdaa0d0ec8031/src/inline_internal.h#L1510) to [Ponylang](https://github.com/ponylang/ponyc/blob/7d38ffa91cf5f89f94daf6f195dfae3bd3395355/src/libponyrt/actor/messageq.c#L31).
 
 We can also merge the non-blocking-lock acquisition and release into the MPSC algorithm itself by having the pop-end be `ATOMIC_CMPXCHG` acquired with a sentinel value and released by storing the actual pointer after popping from the queue with the acquired pop-end. Again, here's just the nitty gritty for those interested.
 
@@ -387,11 +387,11 @@ The run queue is now optimized and by this point it has improved throughput the 
 
 I mentioned before that putting a thread to sleep and waking it up are both "expensive" syscalls. We should also not try to wake up all threads for each `notify()` as that would increase contention on the run queues (even if we're already trying hard to avoid it). The best solution that myself and others have found in practice is to throttle thread wake ups.
 
-Throttling in this case means that **when we *do* wake up a thread, we don't wake up another until the woken up thread has actually been scheduled by the OS**. We can take this even further by requiring that the woken up thread to find Tasks before waking another. This is what Golang and Rust async executors do to great results and is what we will do as well, but in a *different* way.
+Throttling in this case means that **when we *do* wake up a thread, we don't wake up another until the woken up thread has actually been scheduled by the OS**. We can take this even further by requiring that the woken up thread to find Tasks before waking another. This is what Golang and Rust async executors do to get great results and is what we will do as well, but in a *different* way.
 
 For context, Golang and Rust use a counter of all the threads who are stealing. They only wake up a thread if there's no threads currently stealing. So `notify()` tries to `ATOMIC_CMPXCHG()` the stealing count from 0 to 1 and wakes only if that's successful. When entering the work stealing portion, the count is incremented if some heuristics deem OK. When leaving, the stealing count is decremented and if the last thread to exit stealing finds a Task, it will try to `notify()` again. This works for other thread pools, but is a bit awkward for us for a few reasons.
 
-We want to have a similar throttling but have different requirements. Unlike Rust, we spawn threads lazily to support static initialization for our thread pool. Unlike Go, we don't use locks for mutual exclusion to know whether to wake up or spawn a new thread on `notify()`. We also want to allow thread spawning to fail without bringing the entire program down from a `panic()` like both Go and Rust. Threads are a resource which, like memory, can be constrained at runtime and we should be explicit about handle it as per Zig Zen.
+We want to have a similar throttling but have different requirements. Unlike Rust, we spawn threads lazily to support static initialization for our thread pool. Unlike Go, we don't use locks for mutual exclusion to know whether to wake up or spawn a new thread on `notify()`. We also want to allow thread spawning to fail without bringing the entire program down from a `panic()` like both Go and Rust. Threads are a resource which, like memory, can be constrained at runtime and we should be explicit about how we handle it as per Zig Zen.
 
 (**Update**: I found a way to make the Go-style system work for our thread pool after the blog was written. Go [check out the source](https://github.com/kprotty/zap/blob/blog/src/thread_pool_go_based.zig))
 
